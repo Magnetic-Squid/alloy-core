@@ -19,7 +19,7 @@ mod hint;
 #[cfg(feature = "keccak-cache")]
 mod keccak_cache;
 #[cfg(feature = "keccak-cache-metrics")]
-pub use keccak_cache::KeccakCacheMetricsSnapshot;
+pub use keccak_cache::{KECCAK_CACHE_TIMING_BUCKET_UPPER_BOUNDS_NS, KeccakCacheMetricsSnapshot};
 
 /// The prefix used for hashing messages according to EIP-191.
 pub const EIP191_PREFIX: &str = "\x19Ethereum Signed Message:\n";
