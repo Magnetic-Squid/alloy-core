@@ -156,6 +156,9 @@ sha3-keccak = []
 tiny-keccak = ["dep:tiny-keccak"]
 keccak-cache = ["std", "dep:rapidhash", "dep:fixed-cache"]
 keccak-cache-global = ["keccak-cache"]
+# Add one process-global-cache-sized L1 per hashing thread. Local misses retain the shared cache as
+# an L2 so hashes discovered by another worker remain reusable.
+keccak-cache-local = ["keccak-cache-global", "fixed-cache/alloc"]
 # Diagnostic-only cache outcome counters. Disabled by default so normal cache lookups retain their
 # existing instruction path.
 keccak-cache-metrics = ["keccak-cache-global"]

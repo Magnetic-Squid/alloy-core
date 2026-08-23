@@ -16,8 +16,14 @@ pub(super) const MAX_INPUT_LEN: usize =
     128 - size_of::<B256>() - size_of::<u8>() - size_of::<usize>();
 
 const COUNT: usize = 1 << 17; // ~131k entries * 128 bytes = 16MiB
-static CACHE: fixed_cache::Cache<Key, B256, BuildHasher, CacheConfig> =
-    fixed_cache::static_cache!(Key, B256, COUNT, BuildHasher::new());
+type Cache = fixed_cache::Cache<Key, B256, BuildHasher, CacheConfig>;
+
+static GLOBAL_CACHE: Cache = fixed_cache::static_cache!(Key, B256, COUNT, BuildHasher::new());
+
+#[cfg(feature = "keccak-cache-local")]
+std::thread_local! {
+    static LOCAL_CACHE: Cache = Cache::new(COUNT, BuildHasher::new());
+}
 
 struct CacheConfig {}
 impl fixed_cache::CacheConfig for CacheConfig {
@@ -32,39 +38,62 @@ pub(super) fn compute(input: &[u8], imp: impl FnOnce(&[u8]) -> B256) -> B256 {
         return if input.is_empty() { KECCAK256_EMPTY } else { keccak256(input) };
     }
 
-    #[cfg(not(feature = "keccak-cache-metrics"))]
-    return CACHE.get_or_insert_with_ref(input, imp, |input| {
-        let mut data = [MaybeUninit::uninit(); MAX_INPUT_LEN];
-        unsafe {
-            std::ptr::copy_nonoverlapping(input.as_ptr(), data.as_mut_ptr().cast(), input.len())
-        };
-        Key { len: input.len() as u8, data }
+    #[cfg(all(not(feature = "keccak-cache-local"), not(feature = "keccak-cache-metrics")))]
+    return GLOBAL_CACHE.get_or_insert_with_ref(input, imp, make_key);
+
+    #[cfg(all(feature = "keccak-cache-local", not(feature = "keccak-cache-metrics")))]
+    return LOCAL_CACHE.with(|local_cache| {
+        local_cache.get_or_insert_with_ref(
+            input,
+            |input| GLOBAL_CACHE.get_or_insert_with_ref(input, imp, make_key),
+            make_key,
+        )
     });
 
-    #[cfg(feature = "keccak-cache-metrics")]
+    #[cfg(all(not(feature = "keccak-cache-local"), feature = "keccak-cache-metrics"))]
     {
         let mut missed = false;
-        let output = CACHE.get_or_insert_with_ref(
+        let output = GLOBAL_CACHE.get_or_insert_with_ref(
             input,
             |input| {
                 missed = true;
                 imp(input)
             },
-            |input| {
-                let mut data = [MaybeUninit::uninit(); MAX_INPUT_LEN];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        input.as_ptr(),
-                        data.as_mut_ptr().cast(),
-                        input.len(),
-                    )
-                };
-                Key { len: input.len() as u8, data }
-            },
+            make_key,
         );
-        metrics::record_cacheable(input.len(), missed);
+        metrics::record_cacheable(input.len(), true, missed);
         output
     }
+
+    #[cfg(all(feature = "keccak-cache-local", feature = "keccak-cache-metrics"))]
+    {
+        let mut local_missed = false;
+        let mut global_missed = false;
+        let output = LOCAL_CACHE.with(|local_cache| {
+            local_cache.get_or_insert_with_ref(
+                input,
+                |input| {
+                    local_missed = true;
+                    GLOBAL_CACHE.get_or_insert_with_ref(
+                        input,
+                        |input| {
+                            global_missed = true;
+                            imp(input)
+                        },
+                        make_key,
+                    )
+                },
+                make_key,
+            )
+        });
+        metrics::record_cacheable(input.len(), local_missed, global_missed);
+        output
+    }
+}
+
+#[cfg(feature = "keccak-cache-local")]
+pub(super) fn initialize_local_cache() {
+    LOCAL_CACHE.with(|_| {});
 }
 
 #[cfg(feature = "keccak-cache-metrics")]
@@ -119,6 +148,13 @@ impl std::hash::Hasher for Hasher {
 struct Key {
     len: u8,
     data: [MaybeUninit<u8>; MAX_INPUT_LEN],
+}
+
+#[inline]
+fn make_key(input: &[u8]) -> Key {
+    let mut data = [MaybeUninit::uninit(); MAX_INPUT_LEN];
+    unsafe { std::ptr::copy_nonoverlapping(input.as_ptr(), data.as_mut_ptr().cast(), input.len()) };
+    Key { len: input.len() as u8, data }
 }
 
 impl PartialEq for Key {
@@ -204,8 +240,50 @@ mod tests {
         let after = metrics::snapshot();
         let bucket = metrics::input_size_bucket(input.len());
         assert!(after.misses_by_input_size[bucket] >= before.misses_by_input_size[bucket] + 1);
-        assert!(after.hits_by_input_size[bucket] >= before.hits_by_input_size[bucket] + 1);
+        #[cfg(feature = "keccak-cache-local")]
+        assert!(
+            after.local_hits_by_input_size[bucket] >= before.local_hits_by_input_size[bucket] + 1
+        );
+        #[cfg(not(feature = "keccak-cache-local"))]
+        assert!(
+            after.global_hits_by_input_size[bucket] >= before.global_hits_by_input_size[bucket] + 1
+        );
         assert!(after.empty_bypasses >= before.empty_bypasses + 1);
         assert!(after.oversized_bypasses >= before.oversized_bypasses + 1);
+    }
+
+    #[cfg(all(feature = "keccak-cache-local", feature = "keccak-cache-metrics"))]
+    #[test]
+    fn a_local_miss_reuses_another_threads_global_entry() {
+        let input = b"alloy-keccak-local-cache-cross-thread-unique-input";
+        let before = metrics::snapshot();
+
+        let first = std::thread::spawn(move || {
+            let output = compute(input, keccak256);
+            metrics::flush_current_thread();
+            output
+        })
+        .join()
+        .unwrap();
+        let after_first = metrics::snapshot();
+        let bucket = metrics::input_size_bucket(input.len());
+        assert!(
+            after_first.misses_by_input_size[bucket] >= before.misses_by_input_size[bucket] + 1
+        );
+
+        let second = std::thread::spawn(move || {
+            let output = compute(input, keccak256);
+            metrics::flush_current_thread();
+            output
+        })
+        .join()
+        .unwrap();
+        let after_second = metrics::snapshot();
+
+        assert_eq!(first, second);
+        assert!(
+            after_second.global_hits_by_input_size[bucket]
+                >= after_first.global_hits_by_input_size[bucket] + 1
+        );
     }
 }

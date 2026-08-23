@@ -178,7 +178,15 @@ pub fn keccak256_uncached<T: AsRef<[u8]>>(bytes: T) -> B256 {
     keccak256_impl(bytes.as_ref())
 }
 
-/// Returns a cumulative snapshot of diagnostic global Keccak cache outcomes.
+/// Allocates the calling thread's Keccak L1 before it begins latency-sensitive work.
+///
+/// Other hashing threads initialize their L1 lazily on the first cacheable request.
+#[cfg(feature = "keccak-cache-local")]
+pub fn initialize_local_keccak_cache() {
+    keccak_cache::initialize_local_cache();
+}
+
+/// Returns a cumulative snapshot of diagnostic local/shared Keccak cache outcomes.
 ///
 /// The counters are available only with the `keccak-cache-metrics` feature. Updates are batched
 /// per thread, so a snapshot can lag by fewer than 1,024 calls on each active thread.
