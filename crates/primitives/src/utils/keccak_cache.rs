@@ -32,28 +32,39 @@ pub(super) fn compute(input: &[u8], imp: impl FnOnce(&[u8]) -> B256) -> B256 {
         return if input.is_empty() { KECCAK256_EMPTY } else { keccak256(input) };
     }
 
+    #[cfg(not(feature = "keccak-cache-metrics"))]
+    return CACHE.get_or_insert_with_ref(input, imp, |input| {
+        let mut data = [MaybeUninit::uninit(); MAX_INPUT_LEN];
+        unsafe {
+            std::ptr::copy_nonoverlapping(input.as_ptr(), data.as_mut_ptr().cast(), input.len())
+        };
+        Key { len: input.len() as u8, data }
+    });
+
     #[cfg(feature = "keccak-cache-metrics")]
-    let mut missed = false;
-    let output = CACHE.get_or_insert_with_ref(
-        input,
-        #[cfg(not(feature = "keccak-cache-metrics"))]
-        imp,
-        #[cfg(feature = "keccak-cache-metrics")]
-        |input| {
-            missed = true;
-            imp(input)
-        },
-        |input| {
-            let mut data = [MaybeUninit::uninit(); MAX_INPUT_LEN];
-            unsafe {
-                std::ptr::copy_nonoverlapping(input.as_ptr(), data.as_mut_ptr().cast(), input.len())
-            };
-            Key { len: input.len() as u8, data }
-        },
-    );
-    #[cfg(feature = "keccak-cache-metrics")]
-    metrics::record_cacheable(input.len(), missed);
-    output
+    {
+        let mut missed = false;
+        let output = CACHE.get_or_insert_with_ref(
+            input,
+            |input| {
+                missed = true;
+                imp(input)
+            },
+            |input| {
+                let mut data = [MaybeUninit::uninit(); MAX_INPUT_LEN];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        input.as_ptr(),
+                        data.as_mut_ptr().cast(),
+                        input.len(),
+                    )
+                };
+                Key { len: input.len() as u8, data }
+            },
+        );
+        metrics::record_cacheable(input.len(), missed);
+        output
+    }
 }
 
 #[cfg(feature = "keccak-cache-metrics")]
