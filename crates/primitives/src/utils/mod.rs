@@ -18,6 +18,8 @@ mod hint;
 
 #[cfg(feature = "keccak-cache")]
 mod keccak_cache;
+#[cfg(feature = "keccak-cache-metrics")]
+pub use keccak_cache::KeccakCacheMetricsSnapshot;
 
 /// The prefix used for hashing messages according to EIP-191.
 pub const EIP191_PREFIX: &str = "\x19Ethereum Signed Message:\n";
@@ -174,6 +176,15 @@ pub fn keccak256_cached<T: AsRef<[u8]>>(bytes: T) -> B256 {
 #[inline]
 pub fn keccak256_uncached<T: AsRef<[u8]>>(bytes: T) -> B256 {
     keccak256_impl(bytes.as_ref())
+}
+
+/// Returns a cumulative snapshot of diagnostic global Keccak cache outcomes.
+///
+/// The counters are available only with the `keccak-cache-metrics` feature. Updates are batched
+/// per thread, so a snapshot can lag by fewer than 1,024 calls on each active thread.
+#[cfg(feature = "keccak-cache-metrics")]
+pub fn keccak_cache_metrics() -> KeccakCacheMetricsSnapshot {
+    keccak_cache::metrics_snapshot()
 }
 
 #[allow(unused)]

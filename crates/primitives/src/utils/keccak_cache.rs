@@ -6,6 +6,11 @@ use super::{hint::unlikely, keccak256_impl as keccak256};
 use crate::{B256, KECCAK256_EMPTY};
 use std::mem::MaybeUninit;
 
+#[cfg(feature = "keccak-cache-metrics")]
+mod metrics;
+#[cfg(feature = "keccak-cache-metrics")]
+pub use metrics::KeccakCacheMetricsSnapshot;
+
 /// Maximum input length that can be cached.
 pub(super) const MAX_INPUT_LEN: usize =
     128 - size_of::<B256>() - size_of::<u8>() - size_of::<usize>();
@@ -22,16 +27,38 @@ impl fixed_cache::CacheConfig for CacheConfig {
 
 pub(super) fn compute(input: &[u8], imp: impl FnOnce(&[u8]) -> B256) -> B256 {
     if unlikely(input.is_empty() | (input.len() > MAX_INPUT_LEN)) {
+        #[cfg(feature = "keccak-cache-metrics")]
+        metrics::record_bypass(input.len());
         return if input.is_empty() { KECCAK256_EMPTY } else { keccak256(input) };
     }
 
-    CACHE.get_or_insert_with_ref(input, imp, |input| {
-        let mut data = [MaybeUninit::uninit(); MAX_INPUT_LEN];
-        unsafe {
-            std::ptr::copy_nonoverlapping(input.as_ptr(), data.as_mut_ptr().cast(), input.len())
-        };
-        Key { len: input.len() as u8, data }
-    })
+    #[cfg(feature = "keccak-cache-metrics")]
+    let mut missed = false;
+    let output = CACHE.get_or_insert_with_ref(
+        input,
+        #[cfg(not(feature = "keccak-cache-metrics"))]
+        imp,
+        #[cfg(feature = "keccak-cache-metrics")]
+        |input| {
+            missed = true;
+            imp(input)
+        },
+        |input| {
+            let mut data = [MaybeUninit::uninit(); MAX_INPUT_LEN];
+            unsafe {
+                std::ptr::copy_nonoverlapping(input.as_ptr(), data.as_mut_ptr().cast(), input.len())
+            };
+            Key { len: input.len() as u8, data }
+        },
+    );
+    #[cfg(feature = "keccak-cache-metrics")]
+    metrics::record_cacheable(input.len(), missed);
+    output
+}
+
+#[cfg(feature = "keccak-cache-metrics")]
+pub(super) fn metrics_snapshot() -> KeccakCacheMetricsSnapshot {
+    metrics::snapshot()
 }
 
 type BuildHasher = std::hash::BuildHasherDefault<Hasher>;
@@ -147,5 +174,27 @@ mod tests {
         assert_eq!(d, e);
 
         assert_eq!(count, 2);
+    }
+
+    #[cfg(feature = "keccak-cache-metrics")]
+    #[test]
+    fn metrics_count_hits_misses_and_bypasses() {
+        let before = metrics::snapshot();
+        let input = b"alloy-keccak-cache-metrics-unique-input";
+
+        let first = compute(input, keccak256);
+        let second = compute(input, keccak256);
+        assert_eq!(first, second);
+        assert_eq!(compute(&[], keccak256), KECCAK256_EMPTY);
+        let oversized = [0x42; MAX_INPUT_LEN + 1];
+        assert_eq!(compute(&oversized, keccak256), keccak256(&oversized));
+        metrics::flush_current_thread();
+
+        let after = metrics::snapshot();
+        let bucket = metrics::input_size_bucket(input.len());
+        assert!(after.misses_by_input_size[bucket] >= before.misses_by_input_size[bucket] + 1);
+        assert!(after.hits_by_input_size[bucket] >= before.hits_by_input_size[bucket] + 1);
+        assert!(after.empty_bypasses >= before.empty_bypasses + 1);
+        assert!(after.oversized_bypasses >= before.oversized_bypasses + 1);
     }
 }
