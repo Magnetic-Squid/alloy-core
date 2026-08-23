@@ -9,9 +9,11 @@ const FLUSH_INTERVAL: u16 = 1_024;
 pub(super) const TIMING_SAMPLE_INTERVAL: u16 = 1_024;
 const TIMING_FLUSH_INTERVAL: u8 = 16;
 
-#[cfg(feature = "keccak-cache-local")]
+#[cfg(all(test, feature = "keccak-cache-local"))]
 pub(super) const LOCAL_LOOKUP_STAGE: usize = 0;
+#[cfg(all(test, not(feature = "keccak-cache-local")))]
 pub(super) const GLOBAL_LOOKUP_STAGE: usize = 1;
+#[cfg(test)]
 pub(super) const HASH_COMPUTE_STAGE: usize = 2;
 const TIMING_STAGES: usize = 3;
 

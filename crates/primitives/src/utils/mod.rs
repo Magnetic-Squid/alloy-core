@@ -143,13 +143,13 @@ pub fn eip191_message<T: AsRef<[u8]>>(message: T) -> Vec<u8> {
 
 /// Simple interface to the [`Keccak-256`] hash function.
 ///
-/// Uses the cache if the `keccak-cache-global` feature is enabled.
+/// Uses the cache if either the `keccak-cache-global` or `keccak-cache-local` feature is enabled.
 ///
 /// [`Keccak-256`]: https://en.wikipedia.org/wiki/SHA-3
 pub fn keccak256<T: AsRef<[u8]>>(bytes: T) -> B256 {
-    #[cfg(feature = "keccak-cache-global")]
+    #[cfg(any(feature = "keccak-cache-global", feature = "keccak-cache-local"))]
     return keccak_cache::compute(bytes.as_ref(), keccak256_impl);
-    #[cfg(not(feature = "keccak-cache-global"))]
+    #[cfg(not(any(feature = "keccak-cache-global", feature = "keccak-cache-local")))]
     return keccak256_impl(bytes.as_ref());
 }
 
@@ -186,7 +186,7 @@ pub fn initialize_local_keccak_cache() {
     keccak_cache::initialize_local_cache();
 }
 
-/// Returns a cumulative snapshot of diagnostic local/shared Keccak cache outcomes.
+/// Returns a cumulative snapshot of diagnostic Keccak cache outcomes.
 ///
 /// The counters are available only with the `keccak-cache-metrics` feature. Updates are batched
 /// per thread, so a snapshot can lag by fewer than 1,024 calls on each active thread.

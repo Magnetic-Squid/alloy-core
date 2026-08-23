@@ -20,6 +20,7 @@ pub(super) const MAX_INPUT_LEN: usize =
 const COUNT: usize = 1 << 17; // ~131k entries * 128 bytes = 16MiB
 type Cache = fixed_cache::Cache<Key, B256, BuildHasher, CacheConfig>;
 
+#[cfg(not(feature = "keccak-cache-local"))]
 static GLOBAL_CACHE: Cache = fixed_cache::static_cache!(Key, B256, COUNT, BuildHasher::new());
 
 #[cfg(feature = "keccak-cache-local")]
@@ -44,13 +45,8 @@ pub(super) fn compute(input: &[u8], imp: impl FnOnce(&[u8]) -> B256) -> B256 {
     return GLOBAL_CACHE.get_or_insert_with_ref(input, imp, make_key);
 
     #[cfg(all(feature = "keccak-cache-local", not(feature = "keccak-cache-metrics")))]
-    return LOCAL_CACHE.with(|local_cache| {
-        local_cache.get_or_insert_with_ref(
-            input,
-            |input| GLOBAL_CACHE.get_or_insert_with_ref(input, imp, make_key),
-            make_key,
-        )
-    });
+    return LOCAL_CACHE
+        .with(|local_cache| local_cache.get_or_insert_with_ref(input, imp, make_key));
 
     #[cfg(all(not(feature = "keccak-cache-local"), feature = "keccak-cache-metrics"))]
     {
@@ -76,25 +72,17 @@ pub(super) fn compute(input: &[u8], imp: impl FnOnce(&[u8]) -> B256) -> B256 {
             return compute_sampled_local(input, imp);
         }
         let mut local_missed = false;
-        let mut global_missed = false;
         let output = LOCAL_CACHE.with(|local_cache| {
             local_cache.get_or_insert_with_ref(
                 input,
                 |input| {
                     local_missed = true;
-                    GLOBAL_CACHE.get_or_insert_with_ref(
-                        input,
-                        |input| {
-                            global_missed = true;
-                            imp(input)
-                        },
-                        make_key,
-                    )
+                    imp(input)
                 },
                 make_key,
             )
         });
-        metrics::record_cacheable(input.len(), local_missed, global_missed);
+        metrics::record_cacheable(input.len(), local_missed, true);
         output
     }
 }
@@ -128,8 +116,6 @@ fn compute_sampled_global(input: &[u8], imp: impl FnOnce(&[u8]) -> B256) -> B256
 #[cold]
 fn compute_sampled_local(input: &[u8], imp: impl FnOnce(&[u8]) -> B256) -> B256 {
     let mut local_missed = false;
-    let mut global_missed = false;
-    let mut global_duration = None;
     let mut hash_duration = None;
     let local_start = Instant::now();
     let output = LOCAL_CACHE.with(|local_cache| {
@@ -137,19 +123,9 @@ fn compute_sampled_local(input: &[u8], imp: impl FnOnce(&[u8]) -> B256) -> B256 
             input,
             |input| {
                 local_missed = true;
-                let global_start = Instant::now();
-                let output = GLOBAL_CACHE.get_or_insert_with_ref(
-                    input,
-                    |input| {
-                        global_missed = true;
-                        let hash_start = Instant::now();
-                        let output = imp(input);
-                        hash_duration = Some(hash_start.elapsed());
-                        output
-                    },
-                    make_key,
-                );
-                global_duration = Some(global_start.elapsed());
+                let hash_start = Instant::now();
+                let output = imp(input);
+                hash_duration = Some(hash_start.elapsed());
                 output
             },
             make_key,
@@ -157,14 +133,9 @@ fn compute_sampled_local(input: &[u8], imp: impl FnOnce(&[u8]) -> B256) -> B256 
     });
     let local_duration = local_start.elapsed();
     let local_lookup_duration =
-        local_duration.saturating_sub(global_duration.unwrap_or(Duration::ZERO));
-    let global_lookup_duration = global_duration
-        .map(|duration| duration.saturating_sub(hash_duration.unwrap_or(Duration::ZERO)));
-    metrics::record_cacheable(input.len(), local_missed, global_missed);
-    metrics::record_timing(
-        input.len(),
-        [Some(local_lookup_duration), global_lookup_duration, hash_duration],
-    );
+        local_duration.saturating_sub(hash_duration.unwrap_or(Duration::ZERO));
+    metrics::record_cacheable(input.len(), local_missed, true);
+    metrics::record_timing(input.len(), [Some(local_lookup_duration), None, hash_duration]);
     output
 }
 
@@ -331,12 +302,22 @@ mod tests {
 
     #[cfg(all(feature = "keccak-cache-local", feature = "keccak-cache-metrics"))]
     #[test]
-    fn a_local_miss_reuses_another_threads_global_entry() {
+    fn a_local_miss_is_recomputed_on_another_thread() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
         let input = b"alloy-keccak-local-cache-cross-thread-unique-input";
         let before = metrics::snapshot();
+        let computations = Arc::new(AtomicUsize::new(0));
 
+        let first_computations = Arc::clone(&computations);
         let first = std::thread::spawn(move || {
-            let output = compute(input, keccak256);
+            let output = compute(input, |input| {
+                first_computations.fetch_add(1, Ordering::Relaxed);
+                keccak256(input)
+            });
             metrics::flush_current_thread();
             output
         })
@@ -348,8 +329,12 @@ mod tests {
             after_first.misses_by_input_size[bucket] >= before.misses_by_input_size[bucket] + 1
         );
 
+        let second_computations = Arc::clone(&computations);
         let second = std::thread::spawn(move || {
-            let output = compute(input, keccak256);
+            let output = compute(input, |input| {
+                second_computations.fetch_add(1, Ordering::Relaxed);
+                keccak256(input)
+            });
             metrics::flush_current_thread();
             output
         })
@@ -358,9 +343,10 @@ mod tests {
         let after_second = metrics::snapshot();
 
         assert_eq!(first, second);
+        assert_eq!(computations.load(Ordering::Relaxed), 2);
         assert!(
-            after_second.global_hits_by_input_size[bucket]
-                >= after_first.global_hits_by_input_size[bucket] + 1
+            after_second.misses_by_input_size[bucket]
+                >= after_first.misses_by_input_size[bucket] + 1
         );
     }
 
@@ -382,6 +368,7 @@ mod tests {
             after.sampled_timing_counts[metrics::LOCAL_LOOKUP_STAGE][bucket]
                 > before.sampled_timing_counts[metrics::LOCAL_LOOKUP_STAGE][bucket]
         );
+        #[cfg(not(feature = "keccak-cache-local"))]
         assert!(
             after.sampled_timing_counts[metrics::GLOBAL_LOOKUP_STAGE][bucket]
                 > before.sampled_timing_counts[metrics::GLOBAL_LOOKUP_STAGE][bucket]
