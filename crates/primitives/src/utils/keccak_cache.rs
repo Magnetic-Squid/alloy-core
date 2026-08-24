@@ -4,9 +4,17 @@
 
 use super::{hint::unlikely, keccak256_impl as keccak256};
 use crate::{B256, KECCAK256_EMPTY};
+#[cfg(feature = "keccak-cache-local")]
+use fixed_cache as _;
 use std::mem::MaybeUninit;
 #[cfg(feature = "keccak-cache-metrics")]
 use std::time::{Duration, Instant};
+#[cfg(feature = "keccak-cache-local")]
+use std::{
+    alloc::{Layout, alloc_zeroed, handle_alloc_error},
+    cell::{Cell, UnsafeCell},
+    ptr,
+};
 
 #[cfg(feature = "keccak-cache-metrics")]
 mod metrics;
@@ -18,6 +26,10 @@ pub(super) const MAX_INPUT_LEN: usize =
     128 - size_of::<B256>() - size_of::<u8>() - size_of::<usize>();
 
 const COUNT: usize = 1 << 17; // ~131k entries * 128 bytes = 16MiB
+#[cfg(feature = "keccak-cache-local")]
+const INDEX_MASK: usize = COUNT - 1;
+
+#[cfg(not(feature = "keccak-cache-local"))]
 type Cache = fixed_cache::Cache<Key, B256, BuildHasher, CacheConfig>;
 
 #[cfg(not(feature = "keccak-cache-local"))]
@@ -25,10 +37,12 @@ static GLOBAL_CACHE: Cache = fixed_cache::static_cache!(Key, B256, COUNT, BuildH
 
 #[cfg(feature = "keccak-cache-local")]
 std::thread_local! {
-    static LOCAL_CACHE: Cache = Cache::new(COUNT, BuildHasher::new());
+    static LOCAL_CACHE: LocalCache = LocalCache::new();
 }
 
+#[cfg(not(feature = "keccak-cache-local"))]
 struct CacheConfig {}
+#[cfg(not(feature = "keccak-cache-local"))]
 impl fixed_cache::CacheConfig for CacheConfig {
     const STATS: bool = false;
     const EPOCHS: bool = false;
@@ -45,8 +59,7 @@ pub(super) fn compute(input: &[u8], imp: impl FnOnce(&[u8]) -> B256) -> B256 {
     return GLOBAL_CACHE.get_or_insert_with_ref(input, imp, make_key);
 
     #[cfg(all(feature = "keccak-cache-local", not(feature = "keccak-cache-metrics")))]
-    return LOCAL_CACHE
-        .with(|local_cache| local_cache.get_or_insert_with_ref(input, imp, make_key));
+    return LOCAL_CACHE.with(|local_cache| local_cache.get_or_insert(input, imp));
 
     #[cfg(all(not(feature = "keccak-cache-local"), feature = "keccak-cache-metrics"))]
     {
@@ -71,17 +84,8 @@ pub(super) fn compute(input: &[u8], imp: impl FnOnce(&[u8]) -> B256) -> B256 {
         if unlikely(metrics::should_sample_timing()) {
             return compute_sampled_local(input, imp);
         }
-        let mut local_missed = false;
-        let output = LOCAL_CACHE.with(|local_cache| {
-            local_cache.get_or_insert_with_ref(
-                input,
-                |input| {
-                    local_missed = true;
-                    imp(input)
-                },
-                make_key,
-            )
-        });
+        let (output, local_missed) =
+            LOCAL_CACHE.with(|local_cache| local_cache.get_or_insert_tracked(input, imp));
         metrics::record_cacheable(input.len(), local_missed, true);
         output
     }
@@ -115,21 +119,15 @@ fn compute_sampled_global(input: &[u8], imp: impl FnOnce(&[u8]) -> B256) -> B256
 #[cfg(all(feature = "keccak-cache-local", feature = "keccak-cache-metrics"))]
 #[cold]
 fn compute_sampled_local(input: &[u8], imp: impl FnOnce(&[u8]) -> B256) -> B256 {
-    let mut local_missed = false;
     let mut hash_duration = None;
     let local_start = Instant::now();
-    let output = LOCAL_CACHE.with(|local_cache| {
-        local_cache.get_or_insert_with_ref(
-            input,
-            |input| {
-                local_missed = true;
-                let hash_start = Instant::now();
-                let output = imp(input);
-                hash_duration = Some(hash_start.elapsed());
-                output
-            },
-            make_key,
-        )
+    let (output, local_missed) = LOCAL_CACHE.with(|local_cache| {
+        local_cache.get_or_insert_tracked(input, |input| {
+            let hash_start = Instant::now();
+            let output = imp(input);
+            hash_duration = Some(hash_start.elapsed());
+            output
+        })
     });
     let local_duration = local_start.elapsed();
     let local_lookup_duration =
@@ -149,10 +147,112 @@ pub(super) fn metrics_snapshot() -> KeccakCacheMetricsSnapshot {
     metrics::snapshot()
 }
 
+#[cfg(feature = "keccak-cache-local")]
+struct LocalCache {
+    buckets: Box<[LocalBucket]>,
+}
+
+#[cfg(feature = "keccak-cache-local")]
+impl LocalCache {
+    fn new() -> Self {
+        let layout = Layout::array::<LocalBucket>(COUNT).unwrap();
+        // Use a zeroed allocation so initialization does not construct 131,072 buckets one by one.
+        // A zero tag denotes an empty bucket, and the entry is deliberately left uninitialized.
+        let buckets = unsafe { alloc_zeroed(layout).cast::<LocalBucket>() };
+        if buckets.is_null() {
+            handle_alloc_error(layout);
+        }
+        let buckets = ptr::slice_from_raw_parts_mut(buckets, COUNT);
+        // SAFETY: `buckets` was allocated for exactly `COUNT` properly aligned `LocalBucket`s.
+        // Zero is valid for `Cell<usize>`, while `MaybeUninit` accepts any bit pattern.
+        Self { buckets: unsafe { Box::from_raw(buckets) } }
+    }
+
+    #[cfg(not(feature = "keccak-cache-metrics"))]
+    #[inline]
+    fn get_or_insert(&self, input: &[u8], compute: impl FnOnce(&[u8]) -> B256) -> B256 {
+        let hash = hash_input(input);
+        let bucket = unsafe { self.buckets.get_unchecked(hash & INDEX_MASK) };
+        // The low index bits are otherwise zero in the tag. Set bit zero so an occupied bucket can
+        // never be confused with the all-zero empty representation.
+        let tag = (hash & !INDEX_MASK) | 1;
+
+        if let Some(output) = bucket.get(input, tag) {
+            return output;
+        }
+
+        let output = compute(input);
+        bucket.insert(input, output, tag);
+        output
+    }
+
+    #[cfg(feature = "keccak-cache-metrics")]
+    #[inline]
+    fn get_or_insert_tracked(
+        &self,
+        input: &[u8],
+        compute: impl FnOnce(&[u8]) -> B256,
+    ) -> (B256, bool) {
+        let hash = hash_input(input);
+        let bucket = unsafe { self.buckets.get_unchecked(hash & INDEX_MASK) };
+        let tag = (hash & !INDEX_MASK) | 1;
+
+        if let Some(output) = bucket.get(input, tag) {
+            return (output, false);
+        }
+
+        let output = compute(input);
+        bucket.insert(input, output, tag);
+        (output, true)
+    }
+}
+
+/// A thread-confined bucket. It deliberately uses ordinary memory rather than the atomic tag and
+/// compare-and-swap in `fixed_cache::Bucket`.
+#[cfg(feature = "keccak-cache-local")]
+#[repr(C, align(128))]
+struct LocalBucket {
+    tag: Cell<usize>,
+    entry: UnsafeCell<MaybeUninit<(Key, B256)>>,
+}
+
+#[cfg(feature = "keccak-cache-local")]
+impl LocalBucket {
+    #[inline]
+    fn get(&self, input: &[u8], tag: usize) -> Option<B256> {
+        if self.tag.get() != tag {
+            return None;
+        }
+
+        // SAFETY: A matching nonzero tag is written only after the entry is initialized. The
+        // enclosing cache is reachable only through thread-local storage, so nothing can mutate
+        // this bucket concurrently.
+        let (key, output) = unsafe { (*self.entry.get()).assume_init_ref() };
+        (key.get() == input).then_some(*output)
+    }
+
+    #[inline]
+    fn insert(&self, input: &[u8], output: B256, tag: usize) {
+        // SAFETY: The enclosing cache is thread-local, and `(Key, B256)` has no drop glue. No
+        // reference into the old entry remains live when insertion begins.
+        unsafe { write_entry(self.entry.get().cast(), input, output) };
+        self.tag.set(tag);
+    }
+}
+
+#[cfg(feature = "keccak-cache-local")]
+#[inline(always)]
+unsafe fn write_entry(entry: *mut (Key, B256), input: &[u8], output: B256) {
+    unsafe { ptr::write(entry, (make_key(input), output)) };
+}
+
+#[cfg(not(feature = "keccak-cache-local"))]
 type BuildHasher = std::hash::BuildHasherDefault<Hasher>;
+#[cfg(not(feature = "keccak-cache-local"))]
 #[derive(Default)]
 struct Hasher(u64);
 
+#[cfg(not(feature = "keccak-cache-local"))]
 impl std::hash::Hasher for Hasher {
     #[inline]
     fn finish(&self) -> u64 {
@@ -161,19 +261,7 @@ impl std::hash::Hasher for Hasher {
 
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        // This is tricky because our most common inputs are medium length: 16..=88
-        // `foldhash` and `rapidhash` have a fast-path for ..16 bytes and outline the rest,
-        // but really we want the opposite, or at least the 16.. path to be inlined.
-
-        // SAFETY: `bytes.len()` is checked to be within the bounds of `MAX_INPUT_LEN` by caller.
-        unsafe { core::hint::assert_unchecked(bytes.len() <= MAX_INPUT_LEN) };
-        if bytes.len() <= 16 {
-            super::hint::cold_path();
-        }
-        self.0 = rapidhash::v3::rapidhash_v3_micro_inline::<false, false>(
-            bytes,
-            const { &rapidhash::v3::RapidSecrets::seed(0) },
-        );
+        self.0 = rapid_hash(bytes);
     }
 
     // We can just skip hashing the length prefix entirely since we know it's always
@@ -189,6 +277,34 @@ impl std::hash::Hasher for Hasher {
     #[inline]
     fn write_length_prefix(&mut self, len: usize) {
         debug_assert!(len <= MAX_INPUT_LEN, "{len} > {MAX_INPUT_LEN}")
+    }
+}
+
+#[inline]
+fn rapid_hash(bytes: &[u8]) -> u64 {
+    // This is tricky because our most common inputs are medium length: 16..=88
+    // `foldhash` and `rapidhash` have a fast-path for ..16 bytes and outline the rest,
+    // but really we want the opposite, or at least the 16.. path to be inlined.
+
+    // SAFETY: `bytes.len()` is checked to be within the bounds of `MAX_INPUT_LEN` by caller.
+    unsafe { core::hint::assert_unchecked(bytes.len() <= MAX_INPUT_LEN) };
+    if bytes.len() <= 16 {
+        super::hint::cold_path();
+    }
+    rapidhash::v3::rapidhash_v3_micro_inline::<false, false>(
+        bytes,
+        const { &rapidhash::v3::RapidSecrets::seed(0) },
+    )
+}
+
+#[cfg(feature = "keccak-cache-local")]
+#[inline]
+fn hash_input(input: &[u8]) -> usize {
+    let hash = rapid_hash(input);
+    if cfg!(target_pointer_width = "32") {
+        ((hash >> 32) as usize) ^ (hash as usize)
+    } else {
+        hash as usize
     }
 }
 
@@ -241,7 +357,10 @@ mod tests {
     #[test]
     fn sizes() {
         assert_eq!(size_of::<Key>(), MAX_INPUT_LEN + 1);
+        #[cfg(not(feature = "keccak-cache-local"))]
         assert_eq!(size_of::<fixed_cache::Bucket<(Key, B256)>>(), 128);
+        #[cfg(feature = "keccak-cache-local")]
+        assert_eq!(size_of::<LocalBucket>(), 128);
     }
 
     #[test]
