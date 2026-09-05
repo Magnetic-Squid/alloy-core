@@ -159,6 +159,8 @@ sha3-keccak = []
 tiny-keccak = ["dep:tiny-keccak"]
 keccak-cache = ["std", "dep:rapidhash", "dep:fixed-cache"]
 keccak-cache-global = ["keccak-cache"]
+# Give each hashing thread a cache without shared atomic access.
+keccak-cache-local = ["keccak-cache"]
 keccak-cache-stats = ["keccak-cache", "fixed-cache/stats"]
 
 map = ["dep:hashbrown", "dep:foldhash"]
