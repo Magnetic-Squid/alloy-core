@@ -22,6 +22,8 @@ mod keccak_cache;
 pub use keccak_cache::init_keccak_cache;
 #[cfg(feature = "keccak-cache-stats")]
 pub use keccak_cache::{KECCAK_CACHE_STATS, KeccakCacheStats};
+#[cfg(feature = "keccak-cache-metrics")]
+pub use keccak_cache::{KECCAK_CACHE_TIMING_BUCKET_UPPER_BOUNDS_NS, KeccakCacheMetricsSnapshot};
 
 /// The prefix used for hashing messages according to EIP-191.
 pub const EIP191_PREFIX: &str = "\x19Ethereum Signed Message:\n";
@@ -145,13 +147,13 @@ pub fn eip191_message<T: AsRef<[u8]>>(message: T) -> Vec<u8> {
 
 /// Simple interface to the [`Keccak-256`] hash function.
 ///
-/// Uses the cache if the `keccak-cache-global` feature is enabled.
+/// Uses the cache if either the `keccak-cache-global` or `keccak-cache-local` feature is enabled.
 ///
 /// [`Keccak-256`]: https://en.wikipedia.org/wiki/SHA-3
 pub fn keccak256<T: AsRef<[u8]>>(bytes: T) -> B256 {
-    #[cfg(feature = "keccak-cache-global")]
+    #[cfg(any(feature = "keccak-cache-global", feature = "keccak-cache-local"))]
     return keccak_cache::compute(bytes.as_ref(), keccak256_impl);
-    #[cfg(not(feature = "keccak-cache-global"))]
+    #[cfg(not(any(feature = "keccak-cache-global", feature = "keccak-cache-local")))]
     return keccak256_impl(bytes.as_ref());
 }
 
@@ -178,6 +180,18 @@ pub fn keccak256_cached<T: AsRef<[u8]>>(bytes: T) -> B256 {
 #[inline]
 pub fn keccak256_uncached<T: AsRef<[u8]>>(bytes: T) -> B256 {
     keccak256_impl(bytes.as_ref())
+}
+
+/// Allocates the calling thread's Keccak cache before latency-sensitive work.
+#[cfg(feature = "keccak-cache-local")]
+pub fn initialize_local_keccak_cache() {
+    keccak_cache::initialize_local_cache();
+}
+
+/// Returns cumulative diagnostic cache outcomes, batched per thread.
+#[cfg(feature = "keccak-cache-metrics")]
+pub fn keccak_cache_metrics() -> KeccakCacheMetricsSnapshot {
+    keccak_cache::metrics_snapshot()
 }
 
 #[allow(unused)]

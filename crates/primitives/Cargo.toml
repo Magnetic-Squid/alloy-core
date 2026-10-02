@@ -160,6 +160,10 @@ sha3-keccak = []
 tiny-keccak = ["dep:tiny-keccak"]
 keccak-cache = ["std", "dep:rapidhash", "dep:fixed-cache"]
 keccak-cache-global = ["keccak-cache"]
+# Thread-local hashing avoids global cache contention and fallback.
+keccak-cache-local = ["keccak-cache"]
+# Optional diagnostic counters and sampled timings.
+keccak-cache-metrics = ["keccak-cache"]
 keccak-cache-stats = ["keccak-cache", "fixed-cache/stats"]
 
 map = ["dep:hashbrown", "dep:foldhash"]
